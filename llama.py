@@ -360,8 +360,16 @@ class Caller:
 
             @self.pc.on("icecandidate")
             async def on_ice(cand):
+                log.info(f"*** on_ice CALLBACK: cand={cand}")
                 if cand:
-                    await self._enviar_ice(cand)
+                    try:
+                        await self._enviar_ice(cand)
+                        log.info(f"*** ICE enviado: {(cand.candidate or '')[:80]}")
+                    except Exception as e:
+                        log.exception(f"*** on_ice error: {e}")
+            @self.pc.on("icegatheringstatechange")
+            async def on_gather():
+                log.info(f"*** ICE gathering state: {self.pc.iceGatheringState}")
 
             @self.pc.on("connectionstatechange")
             async def on_state():
@@ -394,6 +402,11 @@ class Caller:
 
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
+            try:
+                await self.pc.gatherCandidates()
+                log.info("*** gatherCandidates OK")
+            except Exception as e:
+                log.warning(f"*** gatherCandidates: {e}")
             mlines = re.findall(r"^m=(\w+)", offer.sdp, re.MULTILINE)
             log.info(f"*** SDP [OFFER-LOCAL] m-lines: {mlines}")
             if "application" in mlines:
@@ -449,6 +462,7 @@ class Caller:
             log.exception(f"aplicar_answer: {e}")
 
     async def _enviar_ice(self, candidate):
+        log.info(f"*** _enviar_ice: peer_jid={self.peer_jid}")
         payload = f"{candidate.sdpMid} {candidate.sdpMLineIndex} {candidate.candidate}"
         state_b64 = b64(f"ICE {payload}")
         content = json.dumps({
