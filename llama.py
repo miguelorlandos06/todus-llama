@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Caller ToDus con aiortc + TURN dinámico de ToDus.
-Llama al peer, envía OFFER con DataChannel, aplica ANSWER e ICE."""
+"""Caller ToDus + aiortc + TURN. Espera ICE gathering, usa localDescription.sdp."""
 import os, re, ssl, base64, hashlib, socket, threading, time, uuid, json, logging, sys, asyncio, fractions
-
 import requests, urllib3
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
@@ -21,17 +19,13 @@ RECV_BUFFER = 65536
 RUNTIME     = int(os.environ.get("RUNTIME", "180"))
 
 if not PEER:
-    print("ERROR: falta TODUS_PEER", file=sys.stderr)
-    sys.exit(1)
+    print("ERROR: falta TODUS_PEER", file=sys.stderr); sys.exit(1)
 
 LOG_FILE = f"llama_{PHONE}_{PEER}.log"
-logging.basicConfig(
-    level=logging.INFO,
+logging.basicConfig(level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
-              logging.StreamHandler()]
-)
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()])
 log = logging.getLogger("lla")
 
 
@@ -114,7 +108,6 @@ class Caller:
         self.dc_opened = False
         self._loop    = None
         self.phase    = "init"
-        # TURN
         self._turn_iq_id  = None
         self._turn_response = None
         self._turn_event = threading.Event()
@@ -148,7 +141,6 @@ class Caller:
         raw = socket.create_connection((XMPP_HOST, XMPP_PORT), timeout=30)
         self.sock = ctx.wrap_socket(raw, server_hostname=XMPP_HOST)
         self.sock.settimeout(30)
-
         self.send('<?xml version="1.0"?><stream:stream to="%s" xmlns="jc" xmlns:stream="x1" version="1.0">' % XMPP_DOMAIN, "STREAM-1")
         self.recv_until(b"</stream:features>")
         auth = b"\x00" + self.phone.encode() + b"\x00" + self.jwt.encode()
@@ -239,7 +231,6 @@ class Caller:
     def _on_message(self, stanza):
         log.info(f"\n<<< MSG RAW: {stanza[:600]}")
         self._update_peer_from_stanza(stanza)
-
         m_tcall = re.search(r"<tcall[^>]*?st=['\"]([^'\"]+)['\"][^>]*?cid=['\"]([^'\"]+)['\"]", stanza)
         if not m_tcall:
             m_tcall = re.search(r"<tcall[^>]*?cid=['\"]([^'\"]+)['\"][^>]*?st=['\"]([^'\"]+)['\"]", stanza)
@@ -250,32 +241,24 @@ class Caller:
         st_dec = decode_b64(st_raw)
         cmd = st_dec.split(" ", 1)[0]
         log.info(f"*** TCALL cmd={cmd} cid={cid}")
-
         if cmd == "PICKED":
             log.info("*** PEER PICKED")
             self.call_id = cid
             self.phase = "picked"
             threading.Thread(target=self._crear_offer, daemon=True).start()
         elif cmd == "END":
-            log.warning("*** PEER END")
-            self.phase = "peer_ended"
+            log.warning("*** PEER END"); self.phase = "peer_ended"
 
     def _on_iq(self, stanza):
-        # ── ¿Respuesta a nuestro GET-TURN? ──
         if self._turn_iq_id:
             m_id = re.search(r"\bi(?:d)?=['\"]([^'\"]+)['\"]", stanza)
             if m_id and m_id.group(1) == self._turn_iq_id and "todus:turn:cred" in stanza:
-                self._handle_turn_response(stanza)
-                return
-
-        if "todus:call:status" not in stanza:
-            return
+                self._handle_turn_response(stanza); return
+        if "todus:call:status" not in stanza: return
         q = re.search(r"status=['\"]([^'\"]+)['\"]", stanza)
         if not q: return
-        status = q.group(1)
-        log.info(f"\n<<< IQ STATUS={status}")
+        log.info(f"\n<<< IQ STATUS={q.group(1)}")
         self._update_peer_from_stanza(stanza)
-
         cm = re.search(r"content=['\"]([^'\"]+)['\"]", stanza)
         if not cm: return
         try:
@@ -286,7 +269,6 @@ class Caller:
             cmd = parts[0]
             payload = parts[1] if len(parts) > 1 else ""
             log.info(f"    cmd={cmd} payload_len={len(payload)}")
-
             if cmd == "ANSWER" and not self.answer_sent:
                 self.phase = "answer"
                 asyncio.run_coroutine_threadsafe(self._aplicar_answer(payload), self._loop)
@@ -297,26 +279,21 @@ class Caller:
         except Exception as e:
             log.warning(f"parse IQ: {e}")
 
-    # ───────── TURN ─────────
     def pedir_turn(self):
         self._turn_iq_id = uuid.uuid4().hex
         self._turn_response = None
         self._turn_event.clear()
         self.send(
             f'<iq type="get" id="{self._turn_iq_id}" to="{XMPP_DOMAIN}">'
-            f'<query xmlns="todus:turn:cred"/>'
-            f'</iq>', "GET-TURN"
-        )
+            f'<query xmlns="todus:turn:cred"/></iq>', "GET-TURN")
         if not self._turn_event.wait(timeout=15):
-            log.warning("*** TURN: timeout")
-            return None
+            log.warning("*** TURN: timeout"); return None
         return self._turn_response
 
     def _handle_turn_response(self, stanza):
         m = re.search(r"<query[^>]*>([^<]+)</query>", stanza)
         if not m:
-            log.warning("*** TURN: sin contenido")
-            self._turn_event.set(); return
+            log.warning("*** TURN: sin contenido"); self._turn_event.set(); return
         try:
             b64_content = m.group(1).strip()
             pad = "=" * (-len(b64_content) % 4)
@@ -332,16 +309,10 @@ class Caller:
             self._turn_event.set()
 
     def _build_ice_servers(self, turn):
-        if not turn or not turn.get("uris"):
-            return []
+        if not turn or not turn.get("uris"): return []
         urls = [f"{u['uri']}?transport={u['proto']}" for u in turn["uris"]]
-        return [RTCIceServer(
-            urls=urls,
-            username=turn.get("username", ""),
-            credential=turn.get("password", ""),
-        )]
+        return [RTCIceServer(urls=urls, username=turn.get("username", ""), credential=turn.get("password", ""))]
 
-    # ───────── OFFER ─────────
     def _crear_offer(self):
         asyncio.run_coroutine_threadsafe(self._crear_offer_async(), self._loop)
 
@@ -360,16 +331,11 @@ class Caller:
 
             @self.pc.on("icecandidate")
             async def on_ice(cand):
-                log.info(f"*** on_ice CALLBACK: cand={cand}")
                 if cand:
                     try:
                         await self._enviar_ice(cand)
-                        log.info(f"*** ICE enviado: {(cand.candidate or '')[:80]}")
                     except Exception as e:
                         log.exception(f"*** on_ice error: {e}")
-            @self.pc.on("icegatheringstatechange")
-            async def on_gather():
-                log.info(f"*** ICE gathering state: {self.pc.iceGatheringState}")
 
             @self.pc.on("connectionstatechange")
             async def on_state():
@@ -386,9 +352,7 @@ class Caller:
 
             @self.dc.on("open")
             def on_open():
-                log.info("=" * 60)
-                log.info("*** DATA CHANNEL ABIERTO ***")
-                log.info("=" * 60)
+                log.info("=" * 60); log.info("*** DATA CHANNEL ABIERTO ***"); log.info("=" * 60)
                 self.dc_opened = True
                 asyncio.create_task(self._test_send())
 
@@ -400,19 +364,32 @@ class Caller:
             def on_close():
                 log.info("*** DC cerrado")
 
+            # ── Crear OFFER ──
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
-            try:
-                await self.pc.gatherCandidates()
-                log.info("*** gatherCandidates OK")
-            except Exception as e:
-                log.warning(f"*** gatherCandidates: {e}")
-            mlines = re.findall(r"^m=(\w+)", offer.sdp, re.MULTILINE)
+
+            # ── Esperar a que ICE gathering termine (máx 10s) ──
+            for i in range(100):
+                if self.pc.iceGatheringState == "complete":
+                    log.info(f"*** ICE gathering completado en {i*0.1:.1f}s")
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                log.warning(f"*** ICE gathering timeout: {self.pc.iceGatheringState}")
+
+            # ── Usar localDescription.sdp (incluye candidates) ──
+            final_sdp = self.pc.localDescription.sdp
+            ncands = len(re.findall(r"^a=candidate:", final_sdp, re.MULTILINE))
+            log.info(f"*** SDP contiene {ncands} candidates")
+            for c in re.findall(r"^a=candidate:[^\r\n]+", final_sdp, re.MULTILINE):
+                log.info(f"    {c[:120]}")
+
+            mlines = re.findall(r"^m=(\w+)", final_sdp, re.MULTILINE)
             log.info(f"*** SDP [OFFER-LOCAL] m-lines: {mlines}")
             if "application" in mlines:
                 log.info("*** ✅ OFFER-LOCAL CONTIENE m=application")
 
-            await self._enviar_offer(offer.sdp)
+            await self._enviar_offer(final_sdp)
             self.phase = "offer_sent"
         except Exception as e:
             log.exception(f"crear_offer: {e}")
@@ -436,22 +413,19 @@ class Caller:
         })
         if "/" not in self.peer_jid:
             log.warning(f"*** ⚠️ OFFER peer_jid SIN RESOURCE: {self.peer_jid}")
-        else:
-            log.info(f"*** peer_jid FULL confirmado: {self.peer_jid}")
         iq_id = uuid.uuid4().hex
         self.send(
             f'<iq type="set" id="{iq_id}" to="{self.peer_jid}" from="{self.full_jid}">'
             f'<query xmlns="todus:call:status" '
             f'to_user="{self.peer_jid}" from_user="{self.full_jid}" '
-            f'status="OFFER" content="{b64(content)}"/>'
-            f'</iq>', "OFFER"
-        )
+            f'status="OFFER" content="{b64(content)}"/></iq>', "OFFER")
         log.info("*** OFFER enviado")
 
     async def _aplicar_answer(self, sdp):
         try:
             mlines = re.findall(r"^m=(\w+)", sdp, re.MULTILINE)
-            log.info(f"*** SDP [ANSWER-REMOTE] m-lines: {mlines}")
+            ncands = len(re.findall(r"^a=candidate:", sdp, re.MULTILINE))
+            log.info(f"*** SDP [ANSWER-REMOTE] contiene {ncands} candidates, m-lines: {mlines}")
             if "application" in mlines:
                 log.info("*** ✅ ANSWER-REMOTE CONTIENE m=application")
             answer = RTCSessionDescription(sdp=sdp, type="answer")
@@ -462,7 +436,6 @@ class Caller:
             log.exception(f"aplicar_answer: {e}")
 
     async def _enviar_ice(self, candidate):
-        log.info(f"*** _enviar_ice: peer_jid={self.peer_jid}")
         payload = f"{candidate.sdpMid} {candidate.sdpMLineIndex} {candidate.candidate}"
         state_b64 = b64(f"ICE {payload}")
         content = json.dumps({
@@ -470,16 +443,12 @@ class Caller:
             "msgId": f"call_{uuid.uuid4().hex}", "startTime": -1,
             "state": state_b64, "userId": self.phone + "@im.todus.cu", "type": 32,
         })
-        if "/" not in self.peer_jid:
-            log.warning(f"*** ⚠️ ICE peer_jid SIN RESOURCE: {self.peer_jid}")
         iq_id = uuid.uuid4().hex
         self.send(
             f'<iq type="set" id="{iq_id}" to="{self.peer_jid}" from="{self.full_jid}">'
             f'<query xmlns="todus:call:status" '
             f'to_user="{self.peer_jid}" from_user="{self.full_jid}" '
-            f'status="ICE" content="{b64(content)}"/>'
-            f'</iq>', "ICE"
-        )
+            f'status="ICE" content="{b64(content)}"/></iq>', "ICE")
 
     async def _aplicar_ice(self, payload):
         parts = payload.split(" ", 2)
@@ -510,8 +479,7 @@ class Caller:
             f'<k xmlns="x8"/>'
             f'<tcall xmlns="tcall:n" i="{tc_id}" mi="{msg_id}" '
             f'st="{b64("CALL 1 0")}" cid="{self.call_id}"/>'
-            f'<b>CALL 1 0</b></m>', "CALL"
-        )
+            f'<b>CALL 1 0</b></m>', "CALL")
         self.phase = "calling"
 
     def close(self):
@@ -524,8 +492,7 @@ class Caller:
         except Exception: pass
         try:
             if self.sock:
-                self.send("</stream:stream>", "CLOSE")
-                self.sock.close()
+                self.send("</stream:stream>", "CLOSE"); self.sock.close()
         except Exception: pass
 
 
@@ -537,7 +504,6 @@ async def main_async():
     threading.Thread(target=bot.reader, daemon=True).start()
     threading.Thread(target=bot.keepalive, daemon=True).start()
     threading.Thread(target=bot.llamar, daemon=True).start()
-
     log.info(f"Listo. Llamando a {PEER}. RUNTIME={RUNTIME}s")
     try:
         await asyncio.sleep(RUNTIME)
