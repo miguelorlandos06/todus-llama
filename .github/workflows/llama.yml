@@ -1,0 +1,45 @@
+name: ToDus Llama
+on:
+  workflow_dispatch:
+    inputs:
+      peer:
+        description: "Número destino (ej. 5351417372)"
+        required: true
+        default: "5351417372"
+      runtime:
+        description: "Segundos de llamada"
+        required: false
+        default: "180"
+
+jobs:
+  llamar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libavdevice-dev libavfilter-dev libopus-dev libvpx-dev pkg-config libsrtp2-dev
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run caller
+        env:
+          TODUS_PHONE: ${{ secrets.TODUS_PHONE }}
+          TODUS_PEER: ${{ inputs.peer }}
+          RUNTIME: ${{ inputs.runtime }}
+        run: python llama.py
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-logs-${{ github.run_id }}
+          path: |
+            llama_*.log
+          if-no-files-found: warn
