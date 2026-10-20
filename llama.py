@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Caller con aiortc: llama al peer y envía OFFER con m=application.
-Asegura peer_jid FULL (con resource) actualizándolo desde el f= de cada stanza."""
+"""Caller ToDus con aiortc + TURN dinámico de ToDus.
+Llama al peer, envía OFFER con DataChannel, aplica ANSWER e ICE."""
 import os, re, ssl, base64, hashlib, socket, threading, time, uuid, json, logging, sys, asyncio, fractions
 
 import requests, urllib3
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from av import AudioFrame, VideoFrame
 
@@ -13,8 +13,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 PHONE       = os.environ.get("TODUS_PHONE", "5350155246")
 PEER        = os.environ.get("TODUS_PEER", "")
 AUTH_URL    = "https://auth.todus.cu/v2/auth/token"
-XMPP_HOST   = "ws.todus.cu"
-XMPP_PORT   = 1756
+XMPP_HOST   = os.environ.get("XMPP_HOST", "ws.todus.cu")
+XMPP_PORT   = int(os.environ.get("XMPP_PORT", "1756"))
 XMPP_DOMAIN = "im.todus.cu"
 FAKE_SECRET = "00000000-0000-0000-0000-000000000000"
 RECV_BUFFER = 65536
@@ -51,8 +51,7 @@ def login(phone):
     phone = re.sub(r"[^\d]", "", phone)
     payload = _sf(1, phone) + _sf(2, FAKE_SECRET)
     r = requests.post(AUTH_URL, data=payload, timeout=30, verify=False,
-        headers={"Content-Type": "application/x-protobuf",
-                 "User-Agent": "ToDus 2.1.2 Auth"})
+        headers={"Content-Type": "application/x-protobuf", "User-Agent": "ToDus 2.1.2 Auth"})
     r.raise_for_status()
     m = re.search(r"eyJ[\w\-\.]+", r.content.decode("utf-8", "ignore"))
     if not m: raise RuntimeError(f"No JWT: {r.content[:200]}")
@@ -74,33 +73,27 @@ def decode_b64(s):
 class SilenceTrack(AudioStreamTrack):
     kind = "audio"
     def __init__(self):
-        super().__init__()
-        self._ts = 0
+        super().__init__(); self._ts = 0
     async def recv(self):
         await asyncio.sleep(0.02)
-        frame = AudioFrame(format="s16", layout="mono", samples=960)
-        frame.pts = self._ts
-        frame.sample_rate = 48000
-        for plane in frame.planes:
-            plane.update(bytes(1920))
+        f = AudioFrame(format="s16", layout="mono", samples=960)
+        f.pts = self._ts; f.sample_rate = 48000
+        for p in f.planes: p.update(bytes(1920))
         self._ts += 960
-        return frame
+        return f
 
 
 class BlackVideoTrack(VideoStreamTrack):
     kind = "video"
     def __init__(self):
-        super().__init__()
-        self._ts = 0
+        super().__init__(); self._ts = 0
     async def recv(self):
         await asyncio.sleep(1/30)
-        frame = VideoFrame(width=320, height=240, format="yuv420p")
-        for plane in frame.planes:
-            plane.update(bytes(plane.buffer_size))
-        frame.pts = self._ts
-        frame.time_base = fractions.Fraction(1, 90000)
+        f = VideoFrame(width=320, height=240, format="yuv420p")
+        for p in f.planes: p.update(bytes(p.buffer_size))
+        f.pts = self._ts; f.time_base = fractions.Fraction(1, 90000)
         self._ts += 3000
-        return frame
+        return f
 
 
 class Caller:
@@ -113,7 +106,7 @@ class Caller:
         self.send_lock = threading.Lock()
         self.running  = True
         self.full_jid = f"{self.phone}@{XMPP_DOMAIN}"
-        self.peer_jid = f"{self.peer_num}@{XMPP_DOMAIN}"   # bare inicial
+        self.peer_jid = f"{self.peer_num}@{XMPP_DOMAIN}"
         self.call_id  = None
         self.pc       = None
         self.dc       = None
@@ -121,6 +114,10 @@ class Caller:
         self.dc_opened = False
         self._loop    = None
         self.phase    = "init"
+        # TURN
+        self._turn_iq_id  = None
+        self._turn_response = None
+        self._turn_event = threading.Event()
 
     def send(self, data, label=""):
         with self.send_lock:
@@ -172,8 +169,6 @@ class Caller:
         time.sleep(0.3)
         log.info("=" * 70)
         log.info(f"CONECTADO: {self.full_jid}")
-        log.info(f"peer_jid inicial (bare): {self.peer_jid}")
-        log.info(f"Log: {LOG_FILE}")
         log.info("=" * 70)
 
     def reader(self):
@@ -182,20 +177,26 @@ class Caller:
             try:
                 chunk = self.sock.recv(RECV_BUFFER)
                 if not chunk:
-                    log.warning("SOCKET CERRADO")
-                    return
+                    log.warning("SOCKET CERRADO"); return
                 self.buf += chunk
                 self._process()
             except socket.timeout: continue
             except Exception as e:
-                log.warning(f"reader excepción: {e}")
-                return
+                log.warning(f"reader: {e}"); return
 
     def keepalive(self):
         while self.running:
             time.sleep(25)
             try: self.send(" ", "KEEPALIVE")
             except Exception: return
+
+    def _update_peer_from_stanza(self, stanza):
+        m = re.search(r"\bf=['\"]([^'\"]+)['\"]", stanza)
+        if m and "/" in m.group(1):
+            new_peer = m.group(1)
+            if new_peer != self.peer_jid:
+                log.info(f"*** peer_jid FULL: {new_peer}")
+                self.peer_jid = new_peer
 
     def _process(self):
         while True:
@@ -235,14 +236,6 @@ class Caller:
                 self.buf = b""; return
             self.buf = self.buf[min(candidates):]
 
-    def _update_peer_from_stanza(self, stanza):
-        m_full = re.search(r"\bf=['\"]([^'\"]+)['\"]", stanza)
-        if m_full and "/" in m_full.group(1):
-            new_peer = m_full.group(1)
-            if new_peer != self.peer_jid:
-                log.info(f"*** peer_jid actualizado a FULL: {new_peer}")
-                self.peer_jid = new_peer
-
     def _on_message(self, stanza):
         log.info(f"\n<<< MSG RAW: {stanza[:600]}")
         self._update_peer_from_stanza(stanza)
@@ -268,6 +261,13 @@ class Caller:
             self.phase = "peer_ended"
 
     def _on_iq(self, stanza):
+        # ── ¿Respuesta a nuestro GET-TURN? ──
+        if self._turn_iq_id:
+            m_id = re.search(r"\bi(?:d)?=['\"]([^'\"]+)['\"]", stanza)
+            if m_id and m_id.group(1) == self._turn_iq_id and "todus:turn:cred" in stanza:
+                self._handle_turn_response(stanza)
+                return
+
         if "todus:call:status" not in stanza:
             return
         q = re.search(r"status=['\"]([^'\"]+)['\"]", stanza)
@@ -297,13 +297,66 @@ class Caller:
         except Exception as e:
             log.warning(f"parse IQ: {e}")
 
+    # ───────── TURN ─────────
+    def pedir_turn(self):
+        self._turn_iq_id = uuid.uuid4().hex
+        self._turn_response = None
+        self._turn_event.clear()
+        self.send(
+            f'<iq type="get" id="{self._turn_iq_id}" to="{XMPP_DOMAIN}">'
+            f'<query xmlns="todus:turn:cred"/>'
+            f'</iq>', "GET-TURN"
+        )
+        if not self._turn_event.wait(timeout=15):
+            log.warning("*** TURN: timeout")
+            return None
+        return self._turn_response
+
+    def _handle_turn_response(self, stanza):
+        m = re.search(r"<query[^>]*>([^<]+)</query>", stanza)
+        if not m:
+            log.warning("*** TURN: sin contenido")
+            self._turn_event.set(); return
+        try:
+            b64_content = m.group(1).strip()
+            pad = "=" * (-len(b64_content) % 4)
+            decoded = base64.b64decode(b64_content + pad).decode("utf-8")
+            turn = json.loads(decoded)
+            log.info(f"*** TURN obtenido: user={turn.get('username')} ttl={turn.get('ttl')}")
+            for u in turn.get("uris", []):
+                log.info(f"    {u['proto']}://{u['uri']}")
+            self._turn_response = turn
+        except Exception as e:
+            log.warning(f"*** TURN: error parseando: {e}")
+        finally:
+            self._turn_event.set()
+
+    def _build_ice_servers(self, turn):
+        if not turn or not turn.get("uris"):
+            return []
+        urls = [f"{u['uri']}?transport={u['proto']}" for u in turn["uris"]]
+        return [RTCIceServer(
+            urls=urls,
+            username=turn.get("username", ""),
+            credential=turn.get("password", ""),
+        )]
+
+    # ───────── OFFER ─────────
     def _crear_offer(self):
         asyncio.run_coroutine_threadsafe(self._crear_offer_async(), self._loop)
 
     async def _crear_offer_async(self):
         try:
+            log.info("*** Pidiendo TURN a ToDus...")
+            turn = self.pedir_turn()
+            ice_servers = self._build_ice_servers(turn)
+            if ice_servers:
+                log.info(f"*** TURN configurado: {ice_servers[0].urls}")
+            else:
+                log.warning("*** Sin TURN, ICE podría fallar")
+
             log.info("*** Creando RTCPeerConnection + DataChannel")
-            self.pc = RTCPeerConnection()
+            self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
 
             @self.pc.on("icecandidate")
             async def on_ice(cand):
@@ -329,6 +382,7 @@ class Caller:
                 log.info("*** DATA CHANNEL ABIERTO ***")
                 log.info("=" * 60)
                 self.dc_opened = True
+                asyncio.create_task(self._test_send())
 
             @self.dc.on("message")
             def on_message(msg):
@@ -344,27 +398,31 @@ class Caller:
             log.info(f"*** SDP [OFFER-LOCAL] m-lines: {mlines}")
             if "application" in mlines:
                 log.info("*** ✅ OFFER-LOCAL CONTIENE m=application")
-            else:
-                log.info("*** ❌ OFFER-LOCAL NO contiene m=application")
 
             await self._enviar_offer(offer.sdp)
             self.phase = "offer_sent"
         except Exception as e:
             log.exception(f"crear_offer: {e}")
 
+    async def _test_send(self):
+        try:
+            for i in range(30):
+                msg = f"ping_{i}"
+                self.dc.send(msg)
+                log.info(f"*** DC enviado: {msg}")
+                await asyncio.sleep(1)
+        except Exception as e:
+            log.warning(f"test_send: {e}")
+
     async def _enviar_offer(self, sdp):
         state_b64 = b64(f"OFFER {sdp}")
         content = json.dumps({
-            "callId": self.call_id,
-            "endTime": -1,
-            "msgId": f"call_{uuid.uuid4().hex}",
-            "startTime": -1,
-            "state": state_b64,
-            "userId": self.phone + "@im.todus.cu",
-            "type": 32,
+            "callId": self.call_id, "endTime": -1,
+            "msgId": f"call_{uuid.uuid4().hex}", "startTime": -1,
+            "state": state_b64, "userId": self.phone + "@im.todus.cu", "type": 32,
         })
         if "/" not in self.peer_jid:
-            log.warning(f"*** ⚠️ peer_jid SIN RESOURCE: {self.peer_jid} (el servidor podría descartar)")
+            log.warning(f"*** ⚠️ OFFER peer_jid SIN RESOURCE: {self.peer_jid}")
         else:
             log.info(f"*** peer_jid FULL confirmado: {self.peer_jid}")
         iq_id = uuid.uuid4().hex
@@ -383,12 +441,10 @@ class Caller:
             log.info(f"*** SDP [ANSWER-REMOTE] m-lines: {mlines}")
             if "application" in mlines:
                 log.info("*** ✅ ANSWER-REMOTE CONTIENE m=application")
-            else:
-                log.info("*** ❌ ANSWER-REMOTE NO contiene m=application")
             answer = RTCSessionDescription(sdp=sdp, type="answer")
             await self.pc.setRemoteDescription(answer)
             self.answer_sent = True
-            log.info("*** ANSWER aplicado al PC")
+            log.info("*** ANSWER aplicado")
         except Exception as e:
             log.exception(f"aplicar_answer: {e}")
 
@@ -396,13 +452,9 @@ class Caller:
         payload = f"{candidate.sdpMid} {candidate.sdpMLineIndex} {candidate.candidate}"
         state_b64 = b64(f"ICE {payload}")
         content = json.dumps({
-            "callId": self.call_id,
-            "endTime": -1,
-            "msgId": f"call_{uuid.uuid4().hex}",
-            "startTime": -1,
-            "state": state_b64,
-            "userId": self.phone + "@im.todus.cu",
-            "type": 32,
+            "callId": self.call_id, "endTime": -1,
+            "msgId": f"call_{uuid.uuid4().hex}", "startTime": -1,
+            "state": state_b64, "userId": self.phone + "@im.todus.cu", "type": 32,
         })
         if "/" not in self.peer_jid:
             log.warning(f"*** ⚠️ ICE peer_jid SIN RESOURCE: {self.peer_jid}")
@@ -418,14 +470,12 @@ class Caller:
     async def _aplicar_ice(self, payload):
         parts = payload.split(" ", 2)
         if len(parts) != 3:
-            log.warning(f"ICE mal formado: {payload[:100]!r}")
-            return
+            log.warning(f"ICE mal formado: {payload[:100]!r}"); return
         mid, mline, cand = parts
         try:
             from aiortc.sdp import candidate_from_sdp
             if not mline.isdigit():
-                log.warning(f"ICE mline no numérico: {mline!r}")
-                return
+                log.warning(f"ICE mline no numérico: {mline!r}"); return
             candidate = candidate_from_sdp(cand)
             candidate.sdpMid = mid
             candidate.sdpMLineIndex = int(mline)
@@ -456,8 +506,7 @@ class Caller:
             if self.dc: self.dc.close()
         except Exception: pass
         try:
-            if self.pc:
-                asyncio.run_coroutine_threadsafe(self.pc.close(), self._loop)
+            if self.pc: asyncio.run_coroutine_threadsafe(self.pc.close(), self._loop)
         except Exception: pass
         try:
             if self.sock:
@@ -480,10 +529,7 @@ async def main_async():
         await asyncio.sleep(RUNTIME)
     finally:
         log.info("=" * 70)
-        log.info(f"FASE FINAL: phase={bot.phase}")
-        log.info(f"peer_jid final: {bot.peer_jid}")
-        log.info(f"ANSWER recibido: {bot.answer_sent}")
-        log.info(f"DC abierto: {bot.dc_opened}")
+        log.info(f"FASE FINAL: phase={bot.phase} answer_sent={bot.answer_sent} dc_opened={bot.dc_opened}")
         log.info("=" * 70)
         bot.close()
 
